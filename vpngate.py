@@ -31,7 +31,8 @@ VPNGATE_MIRRORS = [
     "https://cdn.jsdelivr.net/gh/fdciabdul/Vpngate-Scraper-API@main/json/data.json",
     "https://fastly.jsdelivr.net/gh/fdciabdul/Vpngate-Scraper-API@main/json/data.json",
 ]
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://dxs.guozhanjun1982.vip/check?sstp=vpn:vpn@")
+# 修改 Worker 基础检查路径，去掉带认证的尾巴，让脚本通过 ?sstp=host:port 传入
+WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://dxs.guozhanjun1982.vip/check?")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
@@ -257,7 +258,10 @@ def classify_network(host, exit_org, is_datacenter=None):
 
 
 def check_one(node, session):
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+    # 构造正确的测速请求：GET {WORKER}/check?sstp=host:port
+    target_addr = f"{node['host']}:{node['port']}"
+    url = WORKER_CHECK_URL + f"sstp={quote(target_addr, safe='')}"
+    
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -384,8 +388,8 @@ def build_chains_text(data):
         lines.append(
             f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
         )
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        res_nodes = [n for n in nodes if n.get("residential"] == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
         for i, n in enumerate(res_nodes, 1):
             lines.append(f"{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
         for i, n in enumerate(dc_nodes, 1):
@@ -438,8 +442,8 @@ def build_hosts_text(data):
         lines.append(
             f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
         )
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        res_nodes = [n for n in nodes if n.get("residential"] == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
         for i, n in enumerate(res_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
@@ -570,48 +574,3 @@ def main():
     sstp_count = len(sstp_nodes)
     if sstp_count == 0:
         die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点")
-    uniq = dedupe(sstp_nodes)
-
-    if MAX_CHECK_NODES > 0:
-        uniq = uniq[:MAX_CHECK_NODES]
-
-    log("VPN GATE", f"获取原始节点: {raw_count}")
-    log("VPN GATE", f"SSTP 节点: {sstp_count}")
-    log("VPN GATE", f"去重后: {len(uniq)}")
-
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
-    t0 = time.time()
-    results = check_all(uniq, session)
-    elapsed = time.time() - t0
-
-    success = [r for r in results if r.get("success")]
-    failed = [r for r in results if not r.get("success")]
-    worker_errors = [r for r in failed if r.get("worker_error")]
-
-    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}")
-    log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
-
-    if uniq and not success and len(worker_errors) == len(uniq):
-        die("Worker 全部请求异常, 检测服务不可用")
-
-    data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
-    log("RESULT", f"国家数量: {data['stats']['countries']}")
-
-    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
-    log("WEBSITE", "完成")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as exc:
-        die(f"程序异常: {type(exc).__name__}: {exc}")
