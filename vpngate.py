@@ -2,13 +2,6 @@
 """
 VPN Gate SSTP 节点检测流水线
 ============================
-流程:
-  1. 获取 VPN Gate 原始节点 (支持官方 api/iphone CSV 及多个可靠的公共镜像站轮询)
-  2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
-  3. 按 host+port+protocol 去重
-  4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?proxyip=host:port
-  5. 保留 success=true 的节点, 按国家分组, 生成 public/data.json + public/index.html
-  6. 网页端 (GitHub Pages) 读取 data.json 展示
 """
 
 import base64
@@ -332,4 +325,7 @@ def build_outputs(results, raw_count, sstp_count, source):
         "sstp_nodes": sstp_count,
         "checked": len(results),
         "success": len(available),
-        "failed": len(results) - len(available
+        "failed": len(results) - len(available),
+        "countries": len(countries),
+        "residential_est": sum(1 for n in available if n["residential"] == "residential"),
+        "datacenter_est": sum(
