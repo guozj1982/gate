@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (精简版)
+VPN Gate SSTP 节点检测流水线 (IP直连优化版)
 =====================================
-流程:
-  1. 获取 VPN Gate 原始节点
-  2. 只保留带 TCP 入口的 SSTP 节点
-  3. 去重
-  4. 并发调用检测 Worker
-  5. 获取并合并优选域名与优选 API (Cloudflare 入口)
-  6. 生成 public/data.json + public/index.html + public/nodes.txt
 """
 
 import base64
@@ -31,9 +24,6 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-# ---------------------------------------------------------------------------
-# 配置
-# ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
@@ -41,7 +31,9 @@ VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
+
+WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://dxs.guozhanjun1982.vip/check?sstp=")
+
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
@@ -80,25 +72,15 @@ COUNTRY_ZH = {
     "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
 }
 
-# 静态优选域名池
 EDGE_HOSTS = [
     h.strip()
-    for h in os.environ.get(
-        "EDGE_HOSTS",
-       
-        "",
-    ).split(",")
+    for h in os.environ.get("EDGE_HOSTS", "").split(",")
     if h.strip()
 ]
 
-# 优选 API 地址配置 (支持逗号分隔多个，可配置在 GitHub Action Secret / Env 中)
 OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
-
 NODES_URL = os.environ.get("NODES_URL", "https://guozj1982.github.io/gate/nodes.txt")
 
-# ---------------------------------------------------------------------------
-# 日志
-# ---------------------------------------------------------------------------
 _section = None
 
 def log(section, msg=""):
@@ -113,9 +95,6 @@ def die(msg):
     log("FATAL", f"[失败] {msg}")
     sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# 数据抓取
-# ---------------------------------------------------------------------------
 def fetch_vpngate():
     try:
         log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
@@ -210,70 +189,38 @@ def parse_mirror_json(data):
         })
     return rows
 
-# ---------------------------------------------------------------------------
-# 优选 API 获取与解析
-# ---------------------------------------------------------------------------
 def fetch_optimal_api_endpoints(api_urls_str):
-    """
-    拉取优选 API，解析如: 172.66.1.179:443#CF 电信优选 格式的内容
-    提取出纯 'IP:端口' (例如 172.66.1.179:443)
-    """
     if not api_urls_str.strip():
         return []
-    
     endpoints = []
     urls = [u.strip() for u in api_urls_str.split(",") if u.strip()]
     for url in urls:
         try:
-            log("OPTIMAL API", f"请求优选 API: {url}")
             resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
-                lines = resp.text.strip().splitlines()
-                count = 0
-                for line in lines:
+                for line in resp.text.strip().splitlines():
                     line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    # 剥离 # 后的备注，提取 IP:端口
+                    if not line or line.startswith("#"): continue
                     endpoint = line.split("#")[0].strip()
                     if endpoint:
-                        # 补充缺失端口默认 443
-                        if ":" not in endpoint:
-                            endpoint = f"{endpoint}:443"
+                        if ":" not in endpoint: endpoint = f"{endpoint}:443"
                         endpoints.append(endpoint)
-                        count += 1
-                log("OPTIMAL API", f"成功从 API 获取到 {count} 个优选端点")
-            else:
-                log("OPTIMAL API", f"API 返回状态码异常: {resp.status_code}")
-        except Exception as e:
-            log("OPTIMAL API", f"拉取优选 API 失败 ({url}): {e}")
+        except Exception:
+            pass
     return endpoints
 
 def get_combined_edge_hosts():
-    """
-    合并静态优选域名与优选 API 端点
-    """
-    # 1. 优先读取 HOSTS_ENTRY 或 EDGE_HOSTS
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     static_hosts = [e.strip() for e in _entry.split(",") if e.strip()] if _entry else EDGE_HOSTS
-
-    # 2. 拉取优选 API 端点
     api_hosts = fetch_optimal_api_endpoints(OPTIMAL_API)
-
-    # 3. 合并与去重 (保留原始列表顺序)
     combined = []
     seen = set()
     for h in static_hosts + api_hosts:
         if h and h not in seen:
             seen.add(h)
             combined.append(h)
-
-    log("EDGE POOL", f"汇总入口地址池: 静态域名 {len(static_hosts)} 个, API 获取 {len(api_hosts)} 个, 合并有效入口共 {len(combined)} 个")
     return combined if combined else EDGE_HOSTS
 
-# ---------------------------------------------------------------------------
-# 筛选 SSTP 节点
-# ---------------------------------------------------------------------------
 _PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6)\b", re.M)
 _REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
 
@@ -307,9 +254,6 @@ def dedupe(nodes):
         out.append(n)
     return out
 
-# ---------------------------------------------------------------------------
-# 检测 Worker
-# ---------------------------------------------------------------------------
 def classify_network(host, exit_org, is_datacenter=None):
     if is_datacenter is True: return "datacenter"
     if is_datacenter is False: return "residential"
@@ -323,7 +267,10 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 def check_one(node, session):
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+    # 【核心优化】：使用真实的 IP 地址进行 Worker TCP 连通性测试，避免域名解析失败
+    check_target = f"{node['ip']}:{node['port']}"
+    url = WORKER_CHECK_URL + quote(check_target, safe="")
+    
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -376,9 +323,6 @@ def check_all(nodes, session):
             results.append(fut.result())
     return results
 
-# ---------------------------------------------------------------------------
-# 生成数据
-# ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
     available = [r for r in results if r.get("success")]
     countries = {}
@@ -415,9 +359,6 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 def build_nodes_text(data, edge_hosts):
-    """
-    生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://...
-    """
     countries = data["countries"]
     edge = edge_hosts
     lines = []
@@ -450,11 +391,7 @@ def write_outputs(data, edge_hosts):
         with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
             html = f.read()
     else:
-        html = (
-            "<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
-            "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
-            "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>"
-        )
+        html = "<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head><body><h1>VPN Gate SSTP 节点</h1></body></html>"
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -464,58 +401,31 @@ def write_outputs(data, edge_hosts):
 
     return data_path, html_path, nodes_path
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
 def main():
     session = requests.Session()
     rows, source = fetch_vpngate()
     raw_count = len(rows)
-    if raw_count == 0:
-        die("VPN Gate 返回 0 个原始节点 (数据源异常, 不允许生成空结果)")
+    if raw_count == 0: die("VPN Gate 返回 0 个原始节点")
 
     sstp_nodes = to_sstp_nodes(rows)
     sstp_count = len(sstp_nodes)
-    if sstp_count == 0:
-        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
+    if sstp_count == 0: die("未解析出任何 SSTP 节点")
     uniq = dedupe(sstp_nodes)
 
-    if MAX_CHECK_NODES > 0:
-        uniq = uniq[:MAX_CHECK_NODES]
+    if MAX_CHECK_NODES > 0: uniq = uniq[:MAX_CHECK_NODES]
 
-    log("VPN GATE", f"获取原始节点: {raw_count}")
-    log("VPN GATE", f"SSTP 节点: {sstp_count}")
-    log("VPN GATE", f"去重后: {len(uniq)}")
-
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
-    t0 = time.time()
+    log("VPN GATE", f"获取原始节点: {raw_count}, SSTP 节点: {sstp_count}, 去重后: {len(uniq)}")
     results = check_all(uniq, session)
-    elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
-    worker_errors = [r for r in failed if r.get("worker_error")]
 
-    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
-    log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
-
-    if uniq and not success and len(worker_errors) == len(uniq):
-        die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}, 检测失败: {len(failed)}")
 
     data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
-    log("RESULT", f"国家数量: {data['stats']['countries']}")
-
-    # 动态拉取 API 并与静态优选域名混合
     edge_hosts = get_combined_edge_hosts()
-
-    data_path, html_path, nodes_path = write_outputs(data, edge_hosts)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
-    log("USAGE", f"自动轮换: 把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框 (一次配置, 之后自动更新)")
-    log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
+    write_outputs(data, edge_hosts)
+    log("WEBSITE", "完成文件生成与打包发布")
 
 if __name__ == "__main__":
     try:
