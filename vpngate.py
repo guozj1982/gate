@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (Python原生TCP检测版 - 修正版)
+VPN Gate SSTP 节点检测流水线 (Python原生TCP检测 + Pages修复版)
 =========================================================
 """
 
@@ -64,7 +64,7 @@ COUNTRY_ZH = {
     "AT": "奥地利", "HU": "匈牙利", "AR": "阿根廷", "CL": "智利", "CO": "哥伦比亚",
     "NZ": "新西兰", "ZA": "南非", "IL": "以色列", "AE": "阿联酋", "SA": "沙特",
     "EG": "埃及", "HR": "克罗地亚", "BY": "白俄罗斯", "GD": "格林纳达",
-    "LV": "拉脱维亚", "EE": "爱沙尼亚", "LT": "立陶宛", "SK": "斯洛伐克",
+    "LV": "拉脱维亚", "EE": "爱沙尼亚", "LT": "立拓宛", "SK": "斯洛伐克",
     "SI": "斯洛文尼亚", "BG": "保加利亚", "RS": "塞尔维亚", "GE": "格鲁吉亚",
     "MD": "摩尔多瓦", "AM": "亚美尼亚", "KZ": "哈萨克斯坦", "UZ": "乌兹别克斯坦",
     "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
@@ -239,3 +239,190 @@ def to_sstp_nodes(rows):
         host = r["host"]
         if not host.endswith(".opengw.net"):
             host = f"{host}.opengw.net"
+        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"]})
+    return nodes
+
+def dedupe(nodes):
+    seen = set()
+    out = []
+    for n in nodes:
+        key = (n["host"].lower(), n["port"], "sstp")
+        if key in seen: continue
+        seen.add(key)
+        out.append(n)
+    return out
+
+def classify_network(host, exit_org, is_datacenter=None):
+    if is_datacenter is True: return "datacenter"
+    if is_datacenter is False: return "residential"
+    org = (exit_org or "").upper()
+    if org:
+        if any(k in org for k in DATA_CENTER_ORG_KEYWORDS): return "datacenter"
+        if any(k in org for k in RESIDENTIAL_ORG_KEYWORDS): return "residential"
+    h = host.lower()
+    if h.startswith("public-vpn"): return "datacenter"
+    if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
+    return "unknown"
+
+def check_one(node):
+    out = dict(node)
+    out["protocol"] = "sstp"
+    out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+    out["status"] = "failed"
+    out["success"] = False
+    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    out["exit"] = None
+    out["residential"] = classify_network(node["host"], None, None)
+    
+    target_ip = node["ip"]
+    target_port = node["port"]
+    
+    t0 = time.time()
+    try:
+        s = socket.create_connection((target_ip, target_port), timeout=CHECK_TIMEOUT)
+        s.close()
+        latency = int((time.time() - t0) * 1000)
+        
+        out["success"] = True
+        out["status"] = "success"
+        out["latency_ms"] = latency
+        out["error"] = None
+    except Exception as exc:
+        out["success"] = False
+        out["status"] = "failed"
+        out["error"] = str(exc)
+    
+    return out
+
+def check_all(nodes):
+    results = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = [pool.submit(check_one, n) for n in nodes]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    return results
+
+def build_outputs(results, raw_count, sstp_count, source):
+    available = [r for r in results if r.get("success")]
+    countries = {}
+    for n in available:
+        c = n["country"] or "未知"
+        countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
+
+    stats = {
+        "raw_nodes": raw_count,
+        "sstp_nodes": sstp_count,
+        "checked": len(results),
+        "success": len(available),
+        "failed": len(results) - len(available),
+        "countries": len(countries),
+        "residential_est": sum(1 for n in available if n["residential"] == "residential"),
+        "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
+    }
+    by_country = {}
+    for name, grp in countries.items():
+        grp["count"] = len(grp["nodes"])
+        grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
+        grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
+        grp["nodes"].sort(key=lambda n: (
+            0 if n.get("residential") == "residential" else 1,
+            n.get("latency_ms") is None,
+            n.get("latency_ms") or 0,
+            n.get("host") or ""
+        ))
+        by_country[name] = grp
+
+    data = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "source": source,
+        "worker": "python-native-tcp-check",
+        "stats": stats,
+        "countries": by_country,
+        "available": available,
+    }
+    return data
+
+def build_nodes_text(data, edge_hosts):
+    countries = data["countries"]
+    edge = edge_hosts
+    lines = []
+    idx = 0
+    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
+    for cname, grp in ordered:
+        code = str(grp.get("code") or "?").upper()
+        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        nodes = sorted(grp["nodes"], key=lambda n: (
+            0 if n.get("residential") == "residential" else 1,
+            n.get("latency_ms") is None,
+            n.get("latency_ms") or 0,
+            n.get("host") or ""
+        ))
+        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        for i, n in enumerate(res_nodes, 1):
+            entry = edge[idx % len(edge)]
+            idx += 1
+            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+        for i, n in enumerate(dc_nodes, 1):
+            entry = edge[idx % len(edge)]
+            idx += 1
+            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+    return "\n".join(lines) + "\n"
+
+def write_outputs(data, edge_hosts):
+    os.makedirs(PUBLIC_DIR, exist_ok=True)
+
+    # 自动创建空的 .nojekyll 文件，强制 GitHub Pages 关闭 Jekyll 静态构建引擎，解决 404 问题
+    open(os.path.join(PUBLIC_DIR, ".nojekyll"), "w").close()
+
+    data_path = os.path.join(PUBLIC_DIR, "data.json")
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+
+    html_path = os.path.join(PUBLIC_DIR, "index.html")
+    if os.path.exists(TEMPLATE_HTML):
+        with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
+            html = f.read()
+    else:
+        html = "<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head><body><h1>VPN Gate SSTP 节点</h1></body></html>"
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
+    with open(nodes_path, "w", encoding="utf-8") as f:
+        f.write(build_nodes_text(data, edge_hosts))
+
+    return data_path, html_path, nodes_path
+
+def main():
+    rows, source = fetch_vpngate()
+    raw_count = len(rows)
+    if raw_count == 0: die("VPN Gate 返回 0 个原始节点")
+
+    sstp_nodes = to_sstp_nodes(rows)
+    sstp_count = len(sstp_nodes)
+    if sstp_count == 0: die("未解析出任何 SSTP 节点")
+    uniq = dedupe(sstp_nodes)
+
+    if MAX_CHECK_NODES > 0: uniq = uniq[:MAX_CHECK_NODES]
+
+    log("VPN GATE", f"获取原始节点: {raw_count}, SSTP 节点: {sstp_count}, 去重后: {len(uniq)}")
+    results = check_all(uniq)
+
+    success = [r for r in results if r.get("success")]
+    failed = [r for r in results if not r.get("success")]
+
+    log("TCP CHECK", f"检测成功: {len(success)}, 检测失败: {len(failed)}")
+
+    data = build_outputs(results, raw_count, sstp_count, source)
+    edge_hosts = get_combined_edge_hosts()
+    write_outputs(data, edge_hosts)
+    log("WEBSITE", "完成文件生成与打包发布")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        die(f"程序异常: {type(exc).__name__}: {exc}")
