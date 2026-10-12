@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (增强调试版 v3)
+VPN Gate SSTP 节点检测流水线 (增强调试版 v4)
 
 相对原版的改动:
   1. Worker 地址规范化: 空字符串回退默认值, 自动补 https://, 去掉末尾 ?/&, 用 params 传参
@@ -10,6 +10,8 @@ VPN Gate SSTP 节点检测流水线 (增强调试版 v3)
   5. EDT_UUID 不再有硬编码默认值, 未设置时不生成 sub.txt 里的 vless 链接
   6. (v3) CHECK_WORKER 已含 sstp= 前缀时按前缀模式拼接 (如 .../check?sstp=vpn:vpn@)
   7. (v3) 连接失败时输出最底层原因 (DNS 失败 / 拒绝连接 / TLS 错误)
+  8. (v4) CHECK_WORKER 支持逗号分隔多个地址; 开跑前先做 DNS 预检, 跳过无法解析的域名,
+          最后总会回退到内置默认 Worker, 不会再因为一个失效域名导致整批失败
 """
 
 import base64
@@ -18,12 +20,13 @@ import io
 import json
 import os
 import re
+import socket
 import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -53,7 +56,17 @@ def normalize_worker_url(raw):
     return url.rstrip("?&")
 
 
-WORKER_CHECK_URL = normalize_worker_url(os.environ.get("CHECK_WORKER"))
+DEFAULT_WORKER = "https://dxs.guozhanjun1982.vip/check"
+WORKER_CANDIDATES = []
+for _w in re.split(r"[,\s]+", os.environ.get("CHECK_WORKER") or ""):
+    if _w.strip():
+        _u = normalize_worker_url(_w)
+        if _u not in WORKER_CANDIDATES:
+            WORKER_CANDIDATES.append(_u)
+_default_u = normalize_worker_url(DEFAULT_WORKER)
+if _default_u not in WORKER_CANDIDATES:
+    WORKER_CANDIDATES.append(_default_u)  # 兜底: 始终以内置默认 Worker 结尾
+WORKER_CHECK_URL = WORKER_CANDIDATES[0]
 
 
 def worker_request_target(addr):
@@ -70,6 +83,8 @@ def worker_request_target(addr):
         sep = "&" if "?" in base else "?"
         return f"{base}{sep}sstp={quote(addr, safe='')}", None
     return base, {"sstp": addr}
+
+
 CHECK_TOKEN = (os.environ.get("CHECK_TOKEN") or "").strip()
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY") or "32"))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT") or "90")
@@ -423,6 +438,25 @@ def check_all(nodes, session):
     return results
 
 
+def select_worker():
+    """DNS 预检: 依次尝试候选 Worker, 选第一个域名可解析的; 全部失败才退出。"""
+    global WORKER_CHECK_URL
+    tried = []
+    for cand in WORKER_CANDIDATES:
+        host = urlparse(cand).hostname or ""
+        try:
+            socket.getaddrinfo(host, 443)
+        except Exception as exc:
+            log("CLOUDFLARE WORKER", f"跳过无法解析的 Worker: {host} ({type(exc).__name__}: {exc})")
+            tried.append(host)
+            continue
+        if cand != WORKER_CANDIDATES[0]:
+            log("CLOUDFLARE WORKER", f"已回退到可用 Worker: {host}")
+        WORKER_CHECK_URL = cand
+        return cand
+    die("所有 Worker 域名都无法解析: " + ", ".join(tried) + " (请检查 CHECK_WORKER 或 Cloudflare DNS)")
+
+
 def report_errors(failed):
     """打印失败原因统计, 这是排查 Worker 问题最关键的输出。"""
     if not failed:
@@ -686,6 +720,7 @@ def main():
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
 
+    select_worker()
     log("CLOUDFLARE WORKER", f"检测地址: {WORKER_CHECK_URL}" + (" (带 X-Check-Token)" if CHECK_TOKEN else ""))
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s, 重试 {CHECK_RETRIES} 次)")
     t0 = time.time()
