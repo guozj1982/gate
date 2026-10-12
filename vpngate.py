@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 VPN Gate SSTP 节点检测流水线
-============================
 """
 
 import base64
@@ -320,12 +319,299 @@ def build_outputs(results, raw_count, sstp_count, source):
         c = n["country"] or "未知"
         countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
 
-    stats = {
-        "raw_nodes": raw_count,
-        "sstp_nodes": sstp_count,
-        "checked": len(results),
-        "success": len(available),
-        "failed": len(results) - len(available),
-        "countries": len(countries),
-        "residential_est": sum(1 for n in available if n["residential"] == "residential"),
-        "datacenter_est": sum(
+    stats = {}
+    stats["raw_nodes"] = raw_count
+    stats["sstp_nodes"] = sstp_count
+    stats["checked"] = len(results)
+    stats["success"] = len(available)
+    stats["failed"] = len(results) - len(available)
+    stats["countries"] = len(countries)
+    stats["residential_est"] = sum(1 for n in available if n["residential"] == "residential")
+    stats["datacenter_est"] = sum(1 for n in available if n["residential"] == "datacenter")
+
+    by_country = {}
+    for name, grp in countries.items():
+        grp["count"] = len(grp["nodes"])
+        grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
+        grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
+        grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
+        by_country[name] = grp
+
+    data = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "source": source,
+        "worker": WORKER_CHECK_URL,
+        "stats": stats,
+        "countries": by_country,
+        "available": available,
+    }
+    return data
+
+
+CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+
+
+def build_chains_text(data):
+    countries = data["countries"]
+    lines = [
+        "# VPN Gate SSTP 节点 -> edgetunnel 链式代理清单",
+        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 固定地址: {CHAIN_URL}",
+        "#",
+        "# 用法: 在 edgetunnel 节点备注里直接粘贴下面任意一行 (名字与指令连写)",
+        "#    例: 日本-住宅-01$sstp://vpn:vpn@vpnxxx.opengw.net:443",
+        "# 名字保持不变, 只有 $sstp:// 后面的地址每 30 分钟自动更换",
+        "# 账号密码固定 vpn:vpn ; 端口必须保留",
+        "# ========================================================",
+    ]
+    ordered = sorted(
+        countries.items(),
+        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
+    )
+    for cname, grp in ordered:
+        code = str(grp.get("code") or "?").upper()
+        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        nodes = sorted(
+            grp["nodes"],
+            key=lambda n: (
+                0 if n.get("residential") == "residential" else 1,
+                n.get("latency_ms") is None,
+                n.get("latency_ms") or 0,
+                n.get("host") or "",
+            ),
+        )
+        lines.append("")
+        lines.append(
+            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
+        )
+        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        for i, n in enumerate(res_nodes, 1):
+            lines.append(f"{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+        for i, n in enumerate(dc_nodes, 1):
+            lines.append(f"{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+    return "\n".join(lines) + "\n"
+
+
+EDGE_HOSTS = [
+    h.strip()
+    for h in os.environ.get(
+        "EDGE_HOSTS",
+        "cf.3666888.xyz:443,thebeat.gehealthcare.com:443,cf.nyanya.moe:443,cf.1o.ee:443,"
+        "cf.xreak.top:443,www.wto.org:443,versantstore.pearson.com:443",
+    ).split(",")
+    if h.strip()
+]
+
+HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+
+
+def build_hosts_text(data):
+    countries = data["countries"]
+    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
+    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    lines = [
+        "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
+        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 固定地址: {HOSTS_URL}",
+        "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
+        "# ========================================================",
+    ]
+    idx = 0
+    ordered = sorted(
+        countries.items(),
+        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
+    )
+    for cname, grp in ordered:
+        code = str(grp.get("code") or "?").upper()
+        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        nodes = sorted(
+            grp["nodes"],
+            key=lambda n: (
+                0 if n.get("residential") == "residential" else 1,
+                n.get("latency_ms") is None,
+                n.get("latency_ms") or 0,
+                n.get("host") or "",
+            ),
+        )
+        lines.append("")
+        lines.append(
+            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
+        )
+        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        for i, n in enumerate(res_nodes, 1):
+            entry = edge[idx % len(edge)]
+            idx += 1
+            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+        for i, n in enumerate(dc_nodes, 1):
+            entry = edge[idx % len(edge)]
+            idx += 1
+            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+    return "\n".join(lines) + "\n"
+
+
+EDT_UUID = os.environ.get("EDT_UUID", "c2df4486-bf53-40c8-b1e7-63c68fb13890")
+EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "123.guozhanjun1982.vip")
+EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
+SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+
+
+def _b64_secret_encode(plaintext, secret):
+    data = plaintext.encode("utf-8")
+    key = secret.encode("utf-8")
+    mixed = bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
+    return base64.b64encode(mixed).decode("ascii")
+
+
+def _socks5_account(address, default_port=80):
+    address = re.sub(r"^(socks5|http|https|turn|sstp)://", "", address.strip(), flags=re.I).split("#")[0].strip()
+    at = address.rfind("@")
+    auth, hostpart = (address[:at], address[at + 1:]) if at != -1 else ("", address)
+    hostpart = hostpart.split("/")[0]
+    username = password = None
+    if auth:
+        if ":" not in auth:
+            try:
+                auth = base64.b64decode(auth + "=" * (-len(auth) % 4)).decode("utf-8")
+            except Exception:
+                pass
+        parts = auth.split(":", 1)
+        username = parts[0]
+        password = parts[1] if len(parts) > 1 else None
+    hostname, port = hostpart, default_port
+    if hostpart.count(":") == 1 and not hostpart.startswith("["):
+        h, p = hostpart.rsplit(":", 1)
+        if p.isdigit():
+            hostname, port = h, int(p)
+    return {"username": username, "password": password, "hostname": hostname, "port": port}
+
+
+def build_sub_text(data):
+    countries = data["countries"]
+    lines = [
+        "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
+        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 固定地址: {SUB_URL}",
+        f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
+        "# ========================================================",
+    ]
+    ordered = sorted(
+        countries.items(),
+        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
+    )
+    for cname, grp in ordered:
+        code = str(grp.get("code") or "?").upper()
+        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        nodes = sorted(
+            grp["nodes"],
+            key=lambda n: (
+                0 if n.get("residential") == "residential" else 1,
+                n.get("latency_ms") is None,
+                n.get("latency_ms") or 0,
+                n.get("host") or "",
+            ),
+        )
+        for i, n in enumerate(nodes, 1):
+            name = f"{zh}-{i:02d}"
+            chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
+            chain_json = json.dumps(chain, separators=(",", ":"))
+            enc = _b64_secret_encode(chain_json, EDT_UUID)
+            path = quote("/video/" + enc, safe="")
+            link = (
+                f"vless://{EDT_UUID}@{EDT_DOMAIN}:443?security=tls&type=ws"
+                f"&host={EDT_DOMAIN}&fp={EDT_FINGERPRINT}&sni={EDT_DOMAIN}"
+                f"&path={path}&encryption=none&alpn=#{quote(name, safe='')}"
+            )
+            lines.append(link)
+    return "\n".join(lines) + "\n"
+
+
+def write_outputs(data):
+    os.makedirs(PUBLIC_DIR, exist_ok=True)
+    data_path = os.path.join(PUBLIC_DIR, "data.json")
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+
+    html_path = os.path.join(PUBLIC_DIR, "index.html")
+    if os.path.exists(TEMPLATE_HTML):
+        with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
+            html = f.read()
+    else:
+        html = ("<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
+                "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
+                "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    chains_path = os.path.join(PUBLIC_DIR, "chains.txt")
+    with open(chains_path, "w", encoding="utf-8") as f:
+        f.write(build_chains_text(data))
+
+    hosts_path = os.path.join(PUBLIC_DIR, "hosts.txt")
+    with open(hosts_path, "w", encoding="utf-8") as f:
+        f.write(build_hosts_text(data))
+
+    sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
+    with open(sub_path, "w", encoding="utf-8") as f:
+        f.write(build_sub_text(data))
+    return data_path, html_path, chains_path, hosts_path, sub_path
+
+
+def main():
+    session = requests.Session()
+
+    rows, source = fetch_vpngate()
+    raw_count = len(rows)
+    if raw_count == 0:
+        die("VPN Gate 返回 0 个原始节点")
+
+    sstp_nodes = to_sstp_nodes(rows)
+    sstp_count = len(sstp_nodes)
+    if sstp_count == 0:
+        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点")
+    uniq = dedupe(sstp_nodes)
+
+    if MAX_CHECK_NODES > 0:
+        uniq = uniq[:MAX_CHECK_NODES]
+
+    log("VPN GATE", f"获取原始节点: {raw_count}")
+    log("VPN GATE", f"SSTP 节点: {sstp_count}")
+    log("VPN GATE", f"去重后: {len(uniq)}")
+
+    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
+    t0 = time.time()
+    results = check_all(uniq, session)
+    elapsed = time.time() - t0
+
+    success = [r for r in results if r.get("success")]
+    failed = [r for r in results if not r.get("success")]
+    worker_errors = [r for r in failed if r.get("worker_error")]
+
+    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
+    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}")
+    log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
+
+    if uniq and not success and len(worker_errors) == len(uniq):
+        die("Worker 全部请求异常, 检测服务不可用")
+
+    data = build_outputs(results, raw_count, sstp_count, source)
+    log("RESULT", f"可用节点: {len(success)}")
+    log("RESULT", f"国家数量: {data['stats']['countries']}")
+
+    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
+    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
+    log("WEBSITE", "完成")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        die(f"程序异常: {type(exc).__name__}: {exc}")
