@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (增强调试版)
+VPN Gate SSTP 节点检测流水线 (增强调试版 v3)
 
 相对原版的改动:
   1. Worker 地址规范化: 空字符串回退默认值, 自动补 https://, 去掉末尾 ?/&, 用 params 传参
@@ -8,6 +8,8 @@ VPN Gate SSTP 节点检测流水线 (增强调试版)
   3. 对 429 / 5xx / 连接异常自动重试 (CHECK_RETRIES, 默认 2)
   4. 可选 CHECK_TOKEN: 以 X-Check-Token 请求头发送, 方便在 Cloudflare WAF 里放行
   5. EDT_UUID 不再有硬编码默认值, 未设置时不生成 sub.txt 里的 vless 链接
+  6. (v3) CHECK_WORKER 已含 sstp= 前缀时按前缀模式拼接 (如 .../check?sstp=vpn:vpn@)
+  7. (v3) 连接失败时输出最底层原因 (DNS 失败 / 拒绝连接 / TLS 错误)
 """
 
 import base64
@@ -46,10 +48,28 @@ def normalize_worker_url(raw):
     url = (raw or "").strip() or "https://dxs.guozhanjun1982.vip/check"
     if not re.match(r"^https?://", url, re.I):
         url = "https://" + url.lstrip("/")
+    if "sstp=" in url:
+        return url  # 完整前缀模式, 例如 https://x.com/check?sstp=vpn:vpn@
     return url.rstrip("?&")
 
 
 WORKER_CHECK_URL = normalize_worker_url(os.environ.get("CHECK_WORKER"))
+
+
+def worker_request_target(addr):
+    """返回 (url, params)。
+    - CHECK_WORKER 已含 'sstp=' (如 .../check?sstp=vpn:vpn@): 直接把 host:port 接在末尾
+    - 否则: 用 params 传 sstp=host:port
+    """
+    base = WORKER_CHECK_URL
+    if "sstp=" in base:
+        if base.endswith("@"):
+            return base + addr, None
+        if base.endswith("sstp="):
+            return base + quote(addr, safe=""), None
+        sep = "&" if "?" in base else "?"
+        return f"{base}{sep}sstp={quote(addr, safe='')}", None
+    return base, {"sstp": addr}
 CHECK_TOKEN = (os.environ.get("CHECK_TOKEN") or "").strip()
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY") or "32"))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT") or "90")
@@ -288,18 +308,36 @@ def _short(text, limit=100):
     return re.sub(r"\s+", " ", text or "").strip()[:limit]
 
 
+def _root_cause(exc):
+    """沿着异常链找到最底层原因 (DNS 失败 / 拒绝连接 / TLS 错误等)。"""
+    seen = set()
+    e = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        nxt = getattr(e, "reason", None)
+        if not isinstance(nxt, BaseException):
+            nxt = e.args[0] if e.args and isinstance(e.args[0], BaseException) else None
+        if nxt is None:
+            nxt = e.__cause__ or e.__context__
+        if nxt is None:
+            break
+        e = nxt
+    return f"{type(e).__name__}: {_short(str(e), 200)}"
+
+
 def _request_worker(session, target_addr):
     """请求 Worker; 对 429/5xx/连接异常重试。返回 (response, error_str)。"""
     headers = {"User-Agent": "Mozilla/5.0 (gate-checker)"}
     if CHECK_TOKEN:
         headers["X-Check-Token"] = CHECK_TOKEN
 
+    url, params = worker_request_target(target_addr)
     last_err = None
     for attempt in range(CHECK_RETRIES + 1):
         try:
             r = session.get(
-                WORKER_CHECK_URL,
-                params={"sstp": target_addr},
+                url,
+                params=params,
                 timeout=CHECK_TIMEOUT,
                 headers=headers,
             )
@@ -309,12 +347,12 @@ def _request_worker(session, target_addr):
                 continue
             return r, None
         except (requests.ConnectionError, requests.Timeout) as exc:
-            last_err = f"{type(exc).__name__}: {_short(str(exc))}"
+            last_err = f"{type(exc).__name__} <- {_root_cause(exc)}"
             if attempt < CHECK_RETRIES:
                 time.sleep(1.5 * (attempt + 1))
                 continue
         except Exception as exc:
-            return None, f"{type(exc).__name__}: {_short(str(exc))}"
+            return None, f"{type(exc).__name__} <- {_root_cause(exc)}"
     return None, last_err
 
 
