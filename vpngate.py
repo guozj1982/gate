@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (IP直连优化版)
-=====================================
+VPN Gate SSTP 节点检测流水线 (Python原生TCP检测版)
+=================================================
 """
 
 import base64
@@ -10,11 +10,11 @@ import io
 import json
 import os
 import re
+import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 import requests
 
@@ -32,10 +32,8 @@ VPNGATE_MIRROR = os.environ.get(
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://dxs.guozhanjun1982.vip/check?sstp=")
-
-CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
+CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "64")))
+CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "6.0"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
@@ -266,59 +264,40 @@ def classify_network(host, exit_org, is_datacenter=None):
     if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
     return "unknown"
 
-def check_one(node, session):
-    # 【核心优化】：使用真实的 IP 地址进行 Worker TCP 连通性测试，避免域名解析失败
-    check_target = f"{node['ip']}:{node['port']}"
-    url = WORKER_CHECK_URL + quote(check_target, safe="")
-    
+def check_one(node):
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
     out["status"] = "failed"
+    out["success"] = False
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
-    out["residential"] = "unknown"
+    out["residential"] = classify_network(node["host"], None, None)
+    
+    target_ip = node["ip"]
+    target_port = node["port"]
+    
+    t0 = time.time()
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-        if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
-            out["worker_error"] = True
-            return out
-        j = r.json()
-        ok = bool(j.get("success"))
-        out["success"] = ok
-        out["status"] = "success" if ok else "failed"
-        out["latency_ms"] = j.get("responseTime")
-        out["colo"] = j.get("colo")
-        out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        exit_info = j.get("exit") or {}
-        if exit_info:
-            asn = exit_info.get("asn") or {}
-            org = asn.get("org") or asn.get("name") or ""
-            out["exit"] = {
-                "ip": exit_info.get("ip"),
-                "country": exit_info.get("country"),
-                "country_code": exit_info.get("country_code"),
-                "city": exit_info.get("city"),
-                "continent": exit_info.get("continent"),
-                "asn": asn.get("asn"),
-                "org": org,
-                "type": asn.get("type"),
-                "is_datacenter": exit_info.get("is_datacenter"),
-            }
-            out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
-        else:
-            out["residential"] = classify_network(out["host"], None, None)
-        return out
+        s = socket.create_connection((target_ip, target_port), timeout=CHECK_TIMEOUT)
+        s.close()
+        latency = int((time.time() - t0) * 1000)
+        
+        out["success"] = True
+        out["status"] = "success"
+        out["latency_ms"] = latency
+        out["error"] = None
     except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        out["worker_error"] = True
-        return out
+        out["success"] = False
+        out["status"] = "failed"
+        out["error"] = str(exc)
+    
+    return out
 
-def check_all(nodes, session):
+def check_all(nodes):
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
+        futures = [pool.submit(check_one, n) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -351,7 +330,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     data = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
-        "worker": WORKER_CHECK_URL,
+        "worker": "python-native-tcp-check",
         "stats": stats,
         "countries": by_country,
         "available": available,
@@ -367,7 +346,7 @@ def build_nodes_text(data, edge_hosts):
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or ""))
+        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1, n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host"] or ""))
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
@@ -402,7 +381,6 @@ def write_outputs(data, edge_hosts):
     return data_path, html_path, nodes_path
 
 def main():
-    session = requests.Session()
     rows, source = fetch_vpngate()
     raw_count = len(rows)
     if raw_count == 0: die("VPN Gate 返回 0 个原始节点")
@@ -415,12 +393,12 @@ def main():
     if MAX_CHECK_NODES > 0: uniq = uniq[:MAX_CHECK_NODES]
 
     log("VPN GATE", f"获取原始节点: {raw_count}, SSTP 节点: {sstp_count}, 去重后: {len(uniq)}")
-    results = check_all(uniq, session)
+    results = check_all(uniq)
 
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
 
-    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}, 检测失败: {len(failed)}")
+    log("TCP CHECK", f"检测成功: {len(success)}, 检测失败: {len(failed)}")
 
     data = build_outputs(results, raw_count, sstp_count, source)
     edge_hosts = get_combined_edge_hosts()
